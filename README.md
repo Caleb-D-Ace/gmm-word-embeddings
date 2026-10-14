@@ -1,4 +1,4 @@
-# gmm_word_embeddings
+# gmm-word-embeddings
 
 A modern PyTorch implementation of [Gaussian Mixture Word Embeddings based on Athiwaratkun and Wilson (ACL 2017)](https://arxiv.org/abs/1704.08424).
 

@@ -50,6 +50,7 @@ Run `python main.py --help` for this list from the source of truth.
 | `--resume_from` | `None` | Directory of a previous checkpoint to continue training from (see below) |
 | `--log_dir` | `logs/` | Where the per-batch training log CSV is written |
 | `--num_workers` | `0` | Background processes to prepare batches in parallel. Keep at `0` on a laptop; set above `0` on a GPU machine, sized to the CPUs available, so data loading doesn't leave the GPU idle between batches |
+| `--shuffle_buffer_size` | `1,000,000` | Window size (in token positions) for approximate per-epoch shuffling. DataLoader's default `shuffle=True` needs memory proportional to the whole corpus (tens of GB on a full-size run) just to decide batch order; this keeps memory bounded by the window size instead. Bigger window = closer to a true random shuffle, at the cost of more memory and a slightly slower epoch-start (see `ShuffleBufferSampler` in `src/sampler.py`) |
 | `--var_lower` | `0.05` | Smallest variance a Gaussian component may have in any dimension; enforced after every optimizer step (see below) |
 | `--var_upper` | `5.0` | Largest variance a Gaussian component may have in any dimension |
 | `--max_mean_norm` | `8.0` | Largest L2 norm a Gaussian component's mean may have; a longer mean is scaled back to this length without changing its direction |

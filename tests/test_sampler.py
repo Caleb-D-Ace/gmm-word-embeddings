@@ -1,6 +1,6 @@
 import torch
 
-from sampler import NegativeSampler
+from sampler import NegativeSampler, ShuffleBufferSampler
 
 
 def test_weights_sum_to_one():
@@ -31,3 +31,40 @@ def test_default_device_resolves_to_cpu_or_cuda():
     sampler = NegativeSampler(word_counts=[1, 1, 1])
 
     assert sampler.device.type in ("cpu", "cuda")
+
+
+def test_shuffle_buffer_sampler_len_matches_data_source():
+    sampler = ShuffleBufferSampler(data_source=range(500), buffer_size=50)
+
+    assert len(sampler) == 500
+
+
+def test_shuffle_buffer_sampler_yields_every_index_exactly_once():
+    sampler = ShuffleBufferSampler(data_source=range(500), buffer_size=50, seed=0)
+
+    indices = list(sampler)
+
+    assert sorted(indices) == list(range(500))
+
+
+def test_shuffle_buffer_sampler_handles_buffer_larger_than_dataset():
+    sampler = ShuffleBufferSampler(data_source=range(10), buffer_size=1_000_000, seed=0)
+
+    indices = list(sampler)
+
+    assert sorted(indices) == list(range(10))
+
+
+def test_shuffle_buffer_sampler_is_not_just_sequential_order():
+    sampler = ShuffleBufferSampler(data_source=range(500), buffer_size=50, seed=0)
+
+    indices = list(sampler)
+
+    assert indices != list(range(500))
+
+
+def test_shuffle_buffer_sampler_same_seed_is_reproducible():
+    first = list(ShuffleBufferSampler(data_source=range(500), buffer_size=50, seed=42))
+    second = list(ShuffleBufferSampler(data_source=range(500), buffer_size=50, seed=42))
+
+    assert first == second

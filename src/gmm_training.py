@@ -12,7 +12,7 @@ from dataset import SkipGramDataset
 from gmm_word_embedding import GMMWordEmbedding
 import metrics_logger
 from preprocess import id_dtype
-from sampler import NegativeSampler
+from sampler import NegativeSampler, ShuffleBufferSampler
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -37,6 +37,7 @@ class TrainingConfig:
     checkpoint_every: int = 0  # 0 disables checkpointing; e.g. 10 saves a snapshot every 10 epochs into output_path/epoch_<N>/
     resume_from: str = None  # Directory of a previous checkpoint (e.g. output_path/epoch_20) to continue training from; None starts fresh.
     num_workers: int = 0  # Background processes to prepare batches in parallel; 0 means the main process does it
+    shuffle_buffer_size: int = 1_000_000  # Window size for ShuffleBufferSampler; see its docstring for why this isn't just shuffle=True
     var_lower: float = 0.05  # Every variance is clamped to [var_lower, var_upper] after each optimizer step
     var_upper: float = 5.0
     max_mean_norm: float = 8.0  # Each component's mean vector is scaled back to this L2 norm if it grows past it
@@ -115,9 +116,15 @@ class GmmTrainer:
             window_size=self.config.window_size, dtype=id_dtype(self.vocab_size),
         )
         self.sampler = NegativeSampler(word_counts=word_count_list)
+        # DataLoader's own shuffle=True (RandomSampler) builds a torch.randperm(len(dataset))
+        # and converts it to a Python list -- tens of GB for a large corpus. 
+        # ShuffleBufferSampler keeps memory bounded by buffer_size instead;
+        # see its docstring in sampler.py. shuffle and sampler are mutually exclusive DataLoader
+        # kwargs, so shuffle is omitted here rather than set to False.
+        shuffle_sampler = ShuffleBufferSampler(self.dataset, buffer_size=self.config.shuffle_buffer_size)
         # pin_memory only helps when there's a GPU to transfer pinned batches to; harmless but pointless on CPU
         dataloader_kwargs = dict(
-            batch_size=self.config.batch_size, shuffle=True,
+            batch_size=self.config.batch_size, sampler=shuffle_sampler,
             num_workers=self.config.num_workers, pin_memory=(self.device.type == "cuda"),
         )
         if self.config.num_workers > 0:

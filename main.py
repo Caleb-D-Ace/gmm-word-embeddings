@@ -114,6 +114,13 @@ def parse_args() -> TrainingConfig:
              "On a GPU machine, set this above 0 so the CPU can prepare the next batch while the GPU works on the current one."
     )
     parser.add_argument(
+        "--shuffle_buffer_size",
+        type=int,
+        default=1_000_000,
+        help="Window size (in token positions) for approximate per-epoch shuffling (default: 1,000,000). "
+             "Bigger means closer to a true random shuffle but more memory; see sampler.py's ShuffleBufferSampler."
+    )
+    parser.add_argument(
         "--var_lower",
         type=float,
         default=0.05,

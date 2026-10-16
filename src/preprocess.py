@@ -15,8 +15,7 @@ from stopwords import load_stopwords
 
 """
 Preprocess.py prepares a corpus for training.
-    - Tokenizes every word in the corpus, from local files (.txt, .jsonl, .csv/.tsv, .parquet, .arrow;
-      the first four may also be .gz/.bz2-compressed) or a Hugging Face dataset
+    - Tokenizes every word in the corpus (from local text/.jsonl files, or a Hugging Face dataset)
     - Creates a frequency count for each token
     - Indexes all words of a frequency above MIN_FREQ and creates word_to_id and id_to_word for easy index/word translation
     - Outputs corpus_index.bin, containing the entire corpus represented as integer indices
@@ -68,7 +67,6 @@ def csv_reader(file_path: Path, text_key: str = 'text', opener=open, delimiter: 
         for row in csv.DictReader(file, delimiter=delimiter):
             yield from tokenize(row.get(text_key) or '')
 
-# Method to strea
 def parquet_reader(file_path: Path, text_key: str = 'text') -> Iterator[str]:
     try:
         import pyarrow.parquet as pq
@@ -251,15 +249,13 @@ def main():
     )
     parser.add_argument(
         "--text_key", type=str, default="text",
-        help="Field/column name containing document text, used for every local format except plain .txt, "
-             "and for Hugging Face datasets (default: text)"
+        help="Field name containing document text, used for .jsonl files and Hugging Face datasets (default: text)"
     )
 
     source_group = parser.add_mutually_exclusive_group()
     source_group.add_argument(
         "--raw_dir", type=str, default="data/raw",
-        help="Local file or directory to preprocess: .txt, .jsonl, .csv/.tsv, .parquet, or .arrow "
-             "(the first four may also be .gz/.bz2-compressed) (default: data/raw)"
+        help="Local file or directory of raw text/.jsonl files to preprocess (default: data/raw)"
     )
     source_group.add_argument(
         "--hf_dataset", type=str, default=None,

@@ -10,6 +10,7 @@ data/raw/*
 data/processed/*
 data/model/*
 logs/*
+slurm/*
 .pytest_cache/
 !data/raw/.gitkeep
 !data/processed/.gitkeep

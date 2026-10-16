@@ -8,6 +8,7 @@ The full command-line reference for both pipeline stages, plus checkpointing/res
 - [Training flags](#training-flags)
 - [How a training run flows](#how-a-training-run-flows)
 - [Checkpointing and resuming](#checkpointing-and-resuming)
+- [Submitting to a Slurm cluster](#submitting-to-a-slurm-cluster)
 - [Metrics log](#metrics-log)
 
 
@@ -82,6 +83,25 @@ A resumed run must use the **same `--processed_dir`, `--embedding_dim`, `--k`, a
 - `--epochs` must match the original run's total, since the learning-rate schedule's total step count is recomputed from the config each time rather than saved — changing it part-way through a resumed run shifts the decay schedule away from what the restored scheduler state assumed.
 
 Pointing `--resume_from` at a checkpoint from an already-completed run (where every epoch up to `--epochs` has already run) is harmless: training loop simply has nothing left to do, and re-saves the same final model.
+
+
+## Submitting to a Slurm cluster
+
+[`slurm/preprocess.slurm`](../slurm/preprocess.slurm) and [`slurm/train.slurm`](../slurm/train.slurm) are templates for running the two pipeline stages as separate jobs. They're split up deliberately:
+
+- **Preprocessing has no GPU, and no multiprocessing** — `preprocess.py` is a single-threaded pass over the whole corpus, so it should run on CPU-only resources and gains nothing from requesting more than 1 CPU.
+- **Training needs exactly 1 GPU.** This project has no `DataParallel`/`DistributedDataParallel` code path, so a second GPU would simply sit idle; requesting more than one only costs you a longer queue wait for no benefit.
+
+Chain them with a job dependency, so training only starts once preprocessing finishes successfully:
+
+```bash
+PREP_JOBID=$(sbatch --parsable slurm/preprocess.slurm)
+sbatch --dependency=afterok:$PREP_JOBID slurm/train.slurm
+```
+
+Both scripts have `# TODO` comments marking what needs filling in before they'll run: where your manually-downloaded corpus lives (the cluster has no internet access, so `--hf_dataset` isn't an option there — see [Relocating the Hugging Face download](#preprocessing-flags) if you downloaded via `datasets` on a connected node), setting up a venv *on the cluster* rather than reusing one built elsewhere, and a walltime for each job. None of the walltimes or training hyperparameters in `train.slurm` have been validated at full-corpus scale — run a representative *subset* of the real corpus for a few epochs first, check `grad_norm`/`active_pair_fraction` in [the metrics log](#metrics-log) for stability, time how long an epoch takes, and extrapolate before sizing the real job's walltime and hyperparameters.
+
+Once submitted: `squeue --me` to find your job and node, then `ssh` to that node and run `nvidia-smi`/`nvtop` to confirm the GPU is actually being used rather than sitting idle waiting on data loading. `sacct` gives accounting data afterward.
 
 
 ## Metrics log

@@ -116,10 +116,17 @@ class GmmTrainer:
         )
         self.sampler = NegativeSampler(word_counts=word_count_list)
         # pin_memory only helps when there's a GPU to transfer pinned batches to; harmless but pointless on CPU
-        self.dataloader = DataLoader(
-            self.dataset, batch_size=self.config.batch_size, shuffle=True,
+        dataloader_kwargs = dict(
+            batch_size=self.config.batch_size, shuffle=True,
             num_workers=self.config.num_workers, pin_memory=(self.device.type == "cuda"),
         )
+        if self.config.num_workers > 0:
+            # Always spawn rather than fork workers, on every device -- forking a process that has
+            # already initialized CUDA is unsafe and can duplicate GPU-driver memory per worker.
+            # multiprocessing_context is only a valid kwarg when num_workers > 0 at all, hence the guard.
+            dataloader_kwargs["multiprocessing_context"] = "spawn"
+        self.dataloader = DataLoader(self.dataset, **dataloader_kwargs)
+
 
         self.optimizer = self.make_optimizer(self.model.parameters())
         total_steps = self.config.epochs * len(self.dataloader)

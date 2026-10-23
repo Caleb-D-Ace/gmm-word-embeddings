@@ -11,6 +11,7 @@ The model is trained using a max-margin ranking loss function, which is implemen
 class GMMWordEmbedding(nn.Module):
     VAR_FLOOR = 1e-4  # Added after softplus in get_word_params so a variance can never reach exactly 0
 
+    # Time: O(V*K*D), Space: O(V*K*D)   (V = vocab_size, K = components, D = embedding_dim; one-time model allocation)
     def __init__(self, vocab_size: int, embedding_dim: int = 50, K: int = 2,
                  var_lower: float = 0.05, var_upper: float = 5.0, max_mean_norm: float = 8.0):
         super().__init__()
@@ -45,6 +46,7 @@ class GMMWordEmbedding(nn.Module):
         nn.init.uniform_(self.var_embeddings.weight, 0.1, 1.0) 
         nn.init.zeros_(self.mix_logits.weight)
 
+    # Time: O(n*K*D), Space: O(n*K*D)   (n = word_ids.shape[0]; n=P=batch_size*2*window_size in this codebase's usage)
     def get_word_params(self, word_ids: torch.Tensor):
         """
         Given a batch of word ids, this method retrieves the corresponding means, variances, and mixture weights.
@@ -80,6 +82,8 @@ class GMMWordEmbedding(nn.Module):
         """
         return math.log(math.expm1(var - cls.VAR_FLOOR))
 
+    # Time: O(T*K*D), Space: O(T*K*D)   (T = len(word_ids), the batch's touched rows -- not V, thanks to
+    # sparse embeddings + SparseAdam; see __init__ and make_optimizer)
     @torch.no_grad()
     def project_parameters_(self, word_ids: torch.Tensor):
         """
@@ -110,6 +114,8 @@ class GMMWordEmbedding(nn.Module):
         scale = (self.max_mean_norm / norms).clamp(max=1.0)
         self.mu_embeddings.weight[word_ids] = (mu_rows * scale).view(-1, self.K * self.D)
 
+    # Time: O(n*K^2*D), Space: O(n*K^2*D)   (n = mu1.shape[0] = P; the K*K broadcast below is the single
+    # largest compute block per batch -- everything else in the model is O(n*K*D) or smaller)
     @staticmethod
     def log_overlap(mu1, mu2, var1, var2):
         """
@@ -157,6 +163,8 @@ class GMMWordEmbedding(nn.Module):
 
         return -0.5 * dimensional_sum - (0.5 * D * log_constant)
 
+    # Time: O(n*K^2), Space: O(n*K^2)   (n = log_overlap_matrix.shape[0] = P; no D factor here -- log_overlap
+    # already reduced that axis)
     @staticmethod
     def gmm_energy(log_overlap_matrix, p1, p2):
         """
@@ -181,6 +189,8 @@ class GMMWordEmbedding(nn.Module):
         return torch.logsumexp(log_mix_weights + log_overlap_matrix, dim=(-2, -1))  # Shape: (batch_size,)
 
 
+    # Time: O(P*K^2*D), Space: O(P*K^2*D)   (P = target_ids.shape[0] = batch_size*2*window_size;
+    # dominated by log_overlap -- see its comment)
     def forward(self, target_ids: torch.Tensor, ctx_ids: torch.Tensor):
         """
         Forward pass execution method for PyTorch.
@@ -199,6 +209,7 @@ class GMMWordEmbedding(nn.Module):
         return gmm_energy
 
 
+    # Time: O(P), Space: O(P)   (P = E_pos.shape[0])
     @staticmethod
     def max_margin_ranking(E_pos: torch.Tensor, E_neg: torch.Tensor, margin: float = 1.0):
         """

@@ -101,6 +101,8 @@ class GmmTrainer:
 
     """ Setup method to load the vocab and build the model/data/optimizer pipeline, storing it all on self so
         _run_epoch/_run_batch can use it without a long parameter list."""
+    # Time: O(V log V + V*K*D), Space: O(V*K*D)   (V = vocab_size; one-time cost at the start of
+    # training, not per-batch -- dominated by sorting word counts and allocating the model)
     def _setup(self):
         with open(Path(self.config.processed_dir) / "sorted_vocab.json", "r", encoding="utf-8") as f:
             self.vocab = json.load(f)
@@ -147,6 +149,10 @@ class GmmTrainer:
         to resume at. Requires the checkpoint's vocab to exactly match the one we just built in _setup(),
         since model rows are indexed by word id: silently loading a mismatched vocab would assign the
         wrong word to every embedding row without raising an error. """
+    # Time: O(V*K*D), Space: O(V*K*D)   (V = vocab_size; one-time, only when --resume_from is set.
+    # The optimizer state is just as big as the model itself: SparseAdam's momentum buffers are full
+    # dense (V, K*D) tensors -- sparsity only governs which rows get UPDATED per step, not how much
+    # memory the buffers occupy.)
     def _load_checkpoint(self) -> int:
         resume_dir = Path(self.config.resume_from)
 
@@ -170,6 +176,10 @@ class GmmTrainer:
 
 
     """ Runs every batch in the dataloader once, accumulating and logging epoch-level metrics."""
+    # Time: O(N*W*K^2*D) per epoch, Space: O(P*K^2*D) per batch   (N = corpus tokens, W = 2*window_size,
+    # P = batch_size*W; batch_size cancels out of the per-epoch total since (N/batch_size) batches each
+    # cost O(batch_size*W*K^2*D) -- see _run_batch. Bigger batches don't reduce total FLOPs, only how
+    # many times per-batch fixed overhead (kernel launches, the one sync at the end of _run_batch) is paid.)
     def _run_epoch(self, epoch: int, metrics: metrics_logger.MetricsLogger):
         epoch_start_time = time.perf_counter()
         # Weight each batch's stats by its pair count so the epoch average is exact
@@ -222,6 +232,9 @@ class GmmTrainer:
 
     """ Method that runs the forward/backward/step for one batch of (target, context, negative) ids and
         returns the numbers _run_epoch needs for logging."""
+    # Time: O(P*K^2*D), Space: O(P*K^2*D)   (P = target_ids.shape[0] = batch_size*2*window_size; dominated
+    # by the two forward() calls -- see log_overlap in gmm_word_embedding.py. The touched_ids/project_
+    # parameters_/optimizer.step() pieces are only O(T*K*D), T = touched rows, so they don't change this.)
     def _run_batch(self, target_ids: torch.Tensor, ctx_ids: torch.Tensor, negative_samples: torch.Tensor) -> BatchStats:
         # Get positive and negative energies for this batch
         e_pos = self.model.forward(target_ids, ctx_ids)
@@ -280,6 +293,7 @@ class GmmTrainer:
     """ clip_grad_norm_ doesn't support sparse gradients -- this is the same global L2 norm it would
         have computed, read directly from each sparse gradient's own nonzero values (the zero entries
         wouldn't have contributed to the norm either way). Used for logging only, never for clipping. """
+    # Time: O(T*K*D), Space: O(1)   (T = touched rows across all 3 embedding tables this step)
     def _sparse_grad_norm(self) -> torch.Tensor:
         squared_sums = [
             p.grad.coalesce().values().pow(2).sum()
@@ -297,6 +311,9 @@ class GmmTrainer:
                      model so a later run can continue the same optimizer/scheduler trajectory instead
                      of just warm-starting from these weights.
     """
+    # Time: O(V*K*D), Space: O(V*K*D)   (V = vocab_size; exports the whole vocab regardless of how
+    # sparse training was -- unavoidable, since the saved model has to cover every word, and dwarfed
+    # by the O(N*W*K^2*D) per-epoch training cost anyway, so --checkpoint_every 1 isn't a throughput concern)
     def save_model(self, subdir: str = None, next_epoch: int = None):
         output_dir = Path(self.config.output_path)
         if subdir is not None:
@@ -332,6 +349,7 @@ class GmmTrainer:
         )
 
 
+    # Time: O(B*W), Space: O(B*W)   (Batch size (centers) * Window size (context))
     @staticmethod
     def reshape(centers: torch.Tensor, contexts: torch.Tensor) -> torch.Tensor:
         """

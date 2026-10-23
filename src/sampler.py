@@ -29,6 +29,7 @@ class ShuffleBufferSampler(Sampler[int]):
     def __len__(self):
         return len(self.data_source)
 
+    # Time: O(n), Space: O(buffer_size)   (n = len(data_source); space independent of n -- that's the point)
     def __iter__(self):
         n = len(self.data_source)
         rng = np.random.default_rng(self.seed)
@@ -62,8 +63,9 @@ class NegativeSampler:
     """
     Creates a sample of negative context words for use when training.
     """
+    # Time: O(V), Space: O(V)   (V = vocab_size; one-time setup, not called per batch)
     def __init__(self, word_counts: list[int], power: float = 0.75, device: torch.device = None):
-        # Calculate the probability sampling for the whole vocabulary. 
+        # Calculate the probability sampling for the whole vocabulary.
         # This method is similar to the process in word2vec, where we decrease
         # the importance of word frequency for use as a negative context word
         # by raising it to the power of 0.75 (default).
@@ -84,6 +86,7 @@ class NegativeSampler:
         # Cached cumulative sum for use in sample()
         self.cumsum = torch.cumsum(self.weights, dim=0)
 
+    # Time: O(num_samples * log V), Space: O(num_samples)   (V = vocab_size, via binary search into the cached cumsum)
     def sample(self, num_samples: int) -> torch.Tensor:
         # torch.searchsorted does binary search over the cached cumsum, using u as a random sample selection
         u = torch.rand(num_samples, device=self.device) * self.cumsum[-1]

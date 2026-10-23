@@ -238,9 +238,12 @@ class GmmTrainer:
         # Compute the max-margin ranking loss
         loss, active_fraction = self.model.max_margin_ranking(e_pos, e_neg, self.config.margin)
         loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=float("inf"))  # No clipping, but returns the norm for logging
+        grad_norm = self._sparse_grad_norm()  # For logging only; see its docstring for why this isn't clip_grad_norm_
         self.optimizer.step()
-        self.model.project_parameters_()  # Pull any variance or mean the step pushed out of bounds back in
+        # Only the rows this batch's embeddings looked up could have just moved (SparseAdam leaves every
+        # other row untouched), so only those need to be pulled back inside bounds.
+        touched_ids = torch.unique(torch.cat([target_ids, ctx_ids, negative_samples]))
+        self.model.project_parameters_(touched_ids)
         self.scheduler.step()
         self.optimizer.zero_grad()
 
@@ -255,10 +258,24 @@ class GmmTrainer:
     """ Method to create the optimizer based on the configuration. Supports 'adam' and 'adagrad'. """
     def make_optimizer(self, parameters):
         if self.config.optimizer == "adam":
-            return torch.optim.Adam(parameters, lr=self.config.lr)
+            # SparseAdam, not plain Adam: the model's embeddings are sparse=True (see
+            # GMMWordEmbedding.__init__), and plain Adam can't consume sparse gradients at all.
+            # torch.optim.Adagrad below needs no equivalent swap -- it already handles sparse
+            # gradients natively.
+            return torch.optim.SparseAdam(parameters, lr=self.config.lr)
         if self.config.optimizer == "adagrad":
             return torch.optim.Adagrad(parameters, lr=self.config.lr)
         raise ValueError(f"Unknown optimizer '{self.config.optimizer}'. Use 'adagrad' or 'adam'.")
+
+    """ clip_grad_norm_ doesn't support sparse gradients -- this is the same global L2 norm it would
+        have computed, read directly from each sparse gradient's own nonzero values (the zero entries
+        wouldn't have contributed to the norm either way). Used for logging only, never for clipping. """
+    def _sparse_grad_norm(self) -> torch.Tensor:
+        squared_sums = [
+            p.grad.coalesce().values().pow(2).sum()
+            for p in self.model.parameters() if p.grad is not None
+        ]
+        return torch.stack(squared_sums).sum().sqrt()
 
 
     """

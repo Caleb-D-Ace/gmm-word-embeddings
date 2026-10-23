@@ -31,10 +31,14 @@ class GMMWordEmbedding(nn.Module):
         self.raw_var_lower = self.inverse_var_transform(var_lower)
         self.raw_var_upper = self.inverse_var_transform(var_upper)
 
-        # Set up the embedding layers for the means, variances, and mixture weights. These are trainable parameters.
-        self.mu_embeddings = nn.Embedding(vocab_size, K * self.D)
-        self.var_embeddings = nn.Embedding(vocab_size, K * self.D)
-        self.mix_logits = nn.Embedding(vocab_size, K)
+        # sparse=True: each batch only touches a few thousand of (potentially) millions of rows,
+        # but a dense Embedding still runs backward/optimizer.step() over the WHOLE table every
+        # batch regardless -- the cost scales with vocab_size, not batch_size. Sparse gradients
+        # (paired with SparseAdam in make_optimizer, and row-scoped project_parameters_ below)
+        # make the cost scale with how many distinct words actually appear in the batch instead.
+        self.mu_embeddings = nn.Embedding(vocab_size, K * self.D, sparse=True)
+        self.var_embeddings = nn.Embedding(vocab_size, K * self.D, sparse=True)
+        self.mix_logits = nn.Embedding(vocab_size, K, sparse=True)
 
         # Initialize weights with standard distributions
         nn.init.uniform_(self.mu_embeddings.weight, -0.5 / self.D, 0.5 / self.D)
@@ -77,31 +81,34 @@ class GMMWordEmbedding(nn.Module):
         return math.log(math.expm1(var - cls.VAR_FLOOR))
 
     @torch.no_grad()
-    def project_parameters_(self):
+    def project_parameters_(self, word_ids: torch.Tensor):
         """
-        Pulls every word's variances and means back inside their bounds. Call this right after optimizer.step(),
-        so the optimizer takes an unconstrained step and then this projects the result back into the allowed region
-        (projected gradient descent). The trailing underscore follows PyTorch's convention for in-place methods.
+        Pulls the given words' variances and means back inside their bounds. Call this right after
+        optimizer.step(), passing the (deduplicated) word ids involved in this batch's forward pass --
+        under SparseAdam, a row is only ever touched by a step if it appeared in that step's gradient,
+        so these are the only rows that could have just drifted out of bounds. (With dense Adam, every
+        row's momentum could carry it out of bounds even on a batch that didn't touch it, which is why
+        this used to project the whole table; that's no longer true now that the embeddings and the
+        optimizer are both sparse-gradient-aware -- see their setup in __init__/make_optimizer.)
 
         @torch.no_grad() turns off autograd for the whole method. These edits are corrections to the weights, not
         part of the computation being differentiated, and autograd refuses in-place edits to a leaf tensor that
         requires grad anyway.
-
-        The whole table is projected, not just this batch's rows: Adam's momentum keeps moving rows that
-        weren't in the batch, so any row can drift out of bounds on any step.
         """
         # Variances: softplus is monotonic, so clamping the raw weight to [raw_lower, raw_upper] is the same as
-        # clamping the variance to [var_lower, var_upper]. clamp_ (with the underscore) edits the weight in place.
-        self.var_embeddings.weight.clamp_(self.raw_var_lower, self.raw_var_upper)
+        # clamping the variance to [var_lower, var_upper]. Advanced indexing (weight[word_ids]) returns a copy,
+        # not a view, so the clamped result has to be written back explicitly rather than clamped in place.
+        self.var_embeddings.weight[word_ids] = self.var_embeddings.weight[word_ids].clamp(
+            self.raw_var_lower, self.raw_var_upper
+        )
 
-        # Means: cap the L2 norm of each component's mean, not each word's whole row. view() returns a
-        # different-shaped window onto the same memory (no copy), so editing it in place edits the weight itself.
-        mu = self.mu_embeddings.weight.view(self.vocab_size, self.K, self.D)
-        norms = mu.norm(dim=-1, keepdim=True)  # (vocab_size, K, 1): keepdim leaves a size-1 axis so it broadcasts over D
+        # Means: cap the L2 norm of each component's mean, not each word's whole row.
+        mu_rows = self.mu_embeddings.weight[word_ids].view(-1, self.K, self.D)
+        norms = mu_rows.norm(dim=-1, keepdim=True)  # (num_words, K, 1): keepdim broadcasts the scale over D
         # Scale factor is max_norm / norm for components over the cap and 1 for the rest. A zero norm gives
         # inf, which the clamp also turns into 1.
         scale = (self.max_mean_norm / norms).clamp(max=1.0)
-        mu.mul_(scale)
+        self.mu_embeddings.weight[word_ids] = (mu_rows * scale).view(-1, self.K * self.D)
 
     @staticmethod
     def log_overlap(mu1, mu2, var1, var2):

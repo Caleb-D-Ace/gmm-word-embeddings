@@ -81,6 +81,10 @@ class NegativeSampler:
         # Move weights to the appropriate device
         self.weights = self.weights.to(self.device)
 
+        # Cached cumulative sum for use in sample()
+        self.cumsum = torch.cumsum(self.weights, dim=0)
+
     def sample(self, num_samples: int) -> torch.Tensor:
-        # Pick random word IDs using pytorch's multinomial method
-        return torch.multinomial(self.weights, num_samples=num_samples, replacement=True)
+        # torch.searchsorted does binary search over the cached cumsum, using u as a random sample selection
+        u = torch.rand(num_samples, device=self.device) * self.cumsum[-1]
+        return torch.searchsorted(self.cumsum, u)

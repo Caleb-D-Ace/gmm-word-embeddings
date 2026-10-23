@@ -23,7 +23,7 @@ def test_training_config_defaults():
     assert config.num_negatives == 1  # pinned until multi-negative training is implemented
 
 
-@pytest.mark.parametrize("name, expected", [("adagrad", torch.optim.Adagrad), ("adam", torch.optim.Adam)])
+@pytest.mark.parametrize("name, expected", [("adagrad", torch.optim.Adagrad), ("adam", torch.optim.SparseAdam)])
 def test_make_optimizer_builds_the_requested_optimizer(name, expected):
     trainer = GmmTrainer(TrainingConfig(optimizer=name))
     params = list(torch.nn.Linear(2, 2).parameters())

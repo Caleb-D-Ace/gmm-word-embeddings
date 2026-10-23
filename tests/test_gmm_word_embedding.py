@@ -89,7 +89,9 @@ def test_forward_output_shape_and_gradients_flow():
 
     energy.sum().backward()
     assert model.mu_embeddings.weight.grad is not None
-    touched_rows = model.mu_embeddings.weight.grad[[0, 1, 2, 3]]
+    # Sparse gradients don't support plain fancy indexing the way a dense tensor does;
+    # to_dense() is fine at this toy vocab_size -- the point here is just "is it nonzero".
+    touched_rows = model.mu_embeddings.weight.grad.to_dense()[[0, 1, 2, 3]]
     assert torch.any(touched_rows != 0)
 
 
@@ -140,7 +142,7 @@ def test_project_parameters_clamps_variances_into_bounds():
         model.var_embeddings.weight[1].fill_(20.0)   # softplus(20) ~ 20, far above var_upper
         model.var_embeddings.weight[2].fill_(0.5)    # var ~ 0.97, already inside the bounds
 
-    model.project_parameters_()
+    model.project_parameters_(torch.arange(3))
     _, var, _ = model.get_word_params(torch.arange(3))
 
     assert torch.allclose(var[0], torch.tensor(0.05), atol=1e-5)
@@ -155,7 +157,7 @@ def test_project_parameters_caps_each_component_mean_norm_separately():
         # 4-long row instead would wrongly shrink component 1 too.
         model.mu_embeddings.weight[0] = torch.tensor([30.0, 40.0, 3.0, 4.0])
 
-    model.project_parameters_()
+    model.project_parameters_(torch.tensor([0]))
     mu, _, _ = model.get_word_params(torch.tensor([0]))
 
     assert torch.allclose(mu[0, 0], torch.tensor([4.8, 6.4]))  # same direction, rescaled to norm 8
@@ -167,9 +169,25 @@ def test_project_parameters_leaves_a_zero_mean_unchanged():
     with torch.no_grad():
         model.mu_embeddings.weight.zero_()
 
-    model.project_parameters_()
+    model.project_parameters_(torch.tensor([0]))
 
     assert torch.all(model.mu_embeddings.weight == 0)  # max_norm / 0 = inf must not turn into NaN
+
+
+def test_project_parameters_leaves_untouched_rows_alone():
+    model = GMMWordEmbedding(vocab_size=3, embedding_dim=2, K=1, var_lower=0.05, var_upper=5.0, max_mean_norm=1.0)
+    with torch.no_grad():
+        model.var_embeddings.weight.fill_(20.0)  # every row starts out of bounds
+        model.mu_embeddings.weight.fill_(10.0)   # every row's mean norm starts over the cap
+
+    model.project_parameters_(torch.tensor([1]))  # only row 1 was in this batch
+    _, var, _ = model.get_word_params(torch.arange(3))
+
+    assert torch.allclose(var[1], torch.tensor(5.0), atol=1e-4)  # row 1: projected
+    assert torch.allclose(model.mu_embeddings.weight[1].norm(), torch.tensor(1.0), atol=1e-4)
+    for row in (0, 2):  # rows 0 and 2: left exactly as they were, still out of bounds
+        assert torch.allclose(var[row], torch.tensor(20.0), atol=1e-2)
+        assert torch.allclose(model.mu_embeddings.weight[row], torch.tensor([10.0, 10.0]))
 
 
 def test_rejects_variance_bounds_out_of_order():

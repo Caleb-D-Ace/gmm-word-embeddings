@@ -227,13 +227,15 @@ class GmmTrainer:
         e_pos = self.model.forward(target_ids, ctx_ids)
         e_neg = self.model.forward(target_ids, negative_samples)
 
-        # Get the means, variances, and mixture weights for the target words in this batch
+        # Get the means, variances, and mixture weights for the target words in this batch.
+        # Kept as GPU tensors (no .item() yet) so they can be synced to the CPU together,
+        # below, instead of one at a time -- see the comment there for why that matters.
         with (torch.no_grad()):
             mu, var, mix_weights = self.model.get_word_params(target_ids)
-            var_min = var.min().item()
-            var_max = var.max().item()
-            var_mean = var.mean().item()
-            mix_weight_spread = mix_weights.max(dim=-1).values.mean().item()
+            var_min = var.min()
+            var_max = var.max()
+            var_mean = var.mean()
+            mix_weight_spread = mix_weights.max(dim=-1).values.mean()
 
         # Compute the max-margin ranking loss
         loss, active_fraction = self.model.max_margin_ranking(e_pos, e_neg, self.config.margin)
@@ -247,11 +249,19 @@ class GmmTrainer:
         self.scheduler.step()
         self.optimizer.zero_grad()
 
+        # Gather all of our necessary attributes into one .tolist() call instead of 9 .item() calls
+        scalars = torch.stack([
+            loss, active_fraction, e_pos.mean(), e_neg.mean(), grad_norm,
+            mix_weight_spread, var_min, var_max, var_mean,
+        ]).tolist()
+        (loss_v, active_fraction_v, pos_energy_v, neg_energy_v, grad_norm_v,
+         mix_weight_v, var_min_v, var_max_v, var_mean_v) = scalars
+
         return BatchStats(
-            loss=loss.item(), active_fraction=active_fraction.item(),
-            pos_energy=e_pos.mean().item(), neg_energy=e_neg.mean().item(),
-            pair_count=e_pos.numel(), grad_norm=grad_norm.item(),
-            mix_weight=mix_weight_spread, var_min=var_min, var_max=var_max, var_mean=var_mean
+            loss=loss_v, active_fraction=active_fraction_v,
+            pos_energy=pos_energy_v, neg_energy=neg_energy_v,
+            pair_count=e_pos.numel(), grad_norm=grad_norm_v,
+            mix_weight=mix_weight_v, var_min=var_min_v, var_max=var_max_v, var_mean=var_mean_v
         )
 
 

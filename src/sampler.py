@@ -7,18 +7,10 @@ from torch.utils.data import Sampler
 
 class ShuffleBufferSampler(Sampler[int]):
     """
-    Approximates a full per-epoch shuffle for datasets too large to permute in memory.
-
-    DataLoader's default shuffle=True uses RandomSampler, which builds a torch.randperm(n)
-    and converts it to a Python list -- for a large corpus (such as the Huggingface Wikipedia
-    dataset, which creates ~1.9 billion token positions), that's tens of GB just for one 
-    epoch's index order, independent of num_workers or batch_size. This sampler instead keeps 
-    a fixed-size window of "live" indices: each draw picks a random slot in that window, yields
-    it, and refills the slot with the next not-yet-seen index. Memory is O(buffer_size), not 
-    O(len(dataset)) -- the same tradeoff tf.data.Dataset.shuffle makes for the same reason. 
-    Randomization is local to a buffer_size-wide window rather than a true global permutation,
-    which is fine for SGD training but means two indices more than buffer_size apart in the 
-    original order can never land in the same batch.
+    Approximates a shuffle for datasets too large to fully shuffle in memory. Keeps a fixed-size
+    window of indices, swaps a random one out on each draw, and refills it from further along in
+    the dataset. Memory stays bounded by the window size instead of the dataset size, at the cost
+    of only shuffling locally rather than across the whole dataset.
     """
 
     def __init__(self, data_source: Sized, buffer_size: int = 1_000_000, seed: int = None):
@@ -37,8 +29,8 @@ class ShuffleBufferSampler(Sampler[int]):
         buffer = np.arange(buffer_len, dtype=np.int64)
         next_idx = buffer_len
 
-        # Steady state: the buffer stays full. Draw random slot indices in chunks (not all
-        # n at once -- that would just recreate the same O(n) memory problem one level down).
+        # Draw random slots in chunks rather than one at a time, so there's no need to generate
+        # or store more randomness than necessary at once.
         chunk_size = min(buffer_len, 1_000_000)
         steady_draws = n - buffer_len
         drawn = 0
@@ -50,9 +42,7 @@ class ShuffleBufferSampler(Sampler[int]):
                 next_idx += 1
             drawn += chunk
 
-        # Drain: no more unseen indices to refill with. Finish with a Fisher-Yates shuffle
-        # of what's left in the buffer, so the last buffer_len draws are still exactly
-        # uniformly random instead of just whatever order happened to be left over.
+        # Nothing left to refill with, so shuffle whatever remains in the buffer to finish.
         for live_len in range(buffer_len, 0, -1):
             slot = int(rng.integers(0, live_len))
             yield int(buffer[slot])
@@ -86,8 +76,9 @@ class NegativeSampler:
         # Cached cumulative sum for use in sample()
         self.cumsum = torch.cumsum(self.weights, dim=0)
 
-    # Time: O(num_samples * log V), Space: O(num_samples)   (V = vocab_size, via binary search into the cached cumsum)
+    # Time: O(num_samples * log V), Space: O(num_samples)   (V = vocab_size)
     def sample(self, num_samples: int) -> torch.Tensor:
-        # torch.searchsorted does binary search over the cached cumsum, using u as a random sample selection
+        # Picks random points along the cumulative weights and finds where each one lands --
+        # equivalent to sampling words in proportion to their weight.
         u = torch.rand(num_samples, device=self.device) * self.cumsum[-1]
         return torch.searchsorted(self.cumsum, u)

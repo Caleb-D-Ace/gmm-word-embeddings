@@ -101,8 +101,7 @@ class GmmTrainer:
 
     """ Setup method to load the vocab and build the model/data/optimizer pipeline, storing it all on self so
         _run_epoch/_run_batch can use it without a long parameter list."""
-    # Time: O(V log V + V*K*D), Space: O(V*K*D)   (V = vocab_size; one-time cost at the start of
-    # training, not per-batch -- dominated by sorting word counts and allocating the model)
+    # Time: O(V log V + V*K*D), Space: O(V*K*D)   (V = vocab_size; a one-time setup cost, not per batch)
     def _setup(self):
         with open(Path(self.config.processed_dir) / "sorted_vocab.json", "r", encoding="utf-8") as f:
             self.vocab = json.load(f)
@@ -113,20 +112,16 @@ class GmmTrainer:
             self.vocab_size, self.config.embedding_dim, self.config.K,
             var_lower=self.config.var_lower, var_upper=self.config.var_upper, max_mean_norm=self.config.max_mean_norm,
         ).to(self.device)
-        # Only ever called here, in the main process -- never by a DataLoader worker (workers
-        # only call SkipGramDataset.__getitem__, never _setup()). See enable_torch_compile's
-        # docstring for why that distinction has to be made this way instead of autodetected.
+        # Safe to call here: _setup() only ever runs in the main process, never in a data-loading worker.
         enable_torch_compile()
         self.dataset = SkipGramDataset(
             bin_file=Path(self.config.processed_dir) / "corpus_index.bin",
             window_size=self.config.window_size, dtype=id_dtype(self.vocab_size),
         )
         self.sampler = NegativeSampler(word_counts=word_count_list)
-        # DataLoader's own shuffle=True (RandomSampler) builds a torch.randperm(len(dataset))
-        # and converts it to a Python list -- tens of GB for a large corpus. 
-        # ShuffleBufferSampler keeps memory bounded by buffer_size instead;
-        # see its docstring in sampler.py. shuffle and sampler are mutually exclusive DataLoader
-        # kwargs, so shuffle is omitted here rather than set to False.
+        # ShuffleBufferSampler approximates a shuffle with bounded memory, which matters once the
+        # dataset is too large to fully shuffle at once. See its docstring in sampler.py.
+        # ("sampler" and "shuffle" can't both be passed to DataLoader, hence no shuffle= here.)
         shuffle_sampler = ShuffleBufferSampler(self.dataset, buffer_size=self.config.shuffle_buffer_size)
         # pin_memory only helps when there's a GPU to transfer pinned batches to; harmless but pointless on CPU
         dataloader_kwargs = dict(
@@ -134,9 +129,8 @@ class GmmTrainer:
             num_workers=self.config.num_workers, pin_memory=(self.device.type == "cuda"),
         )
         if self.config.num_workers > 0:
-            # Always spawn rather than fork workers, on every device -- forking a process that has
-            # already initialized CUDA is unsafe and can duplicate GPU-driver memory per worker.
-            # multiprocessing_context is only a valid kwarg when num_workers > 0 at all, hence the guard.
+            # "spawn" starts each worker as a fresh process; "fork" (the default) can corrupt
+            # GPU state if CUDA is already in use, as it is here.
             dataloader_kwargs["multiprocessing_context"] = "spawn"
         self.dataloader = DataLoader(self.dataset, **dataloader_kwargs)
 
@@ -153,10 +147,7 @@ class GmmTrainer:
         to resume at. Requires the checkpoint's vocab to exactly match the one we just built in _setup(),
         since model rows are indexed by word id: silently loading a mismatched vocab would assign the
         wrong word to every embedding row without raising an error. """
-    # Time: O(V*K*D), Space: O(V*K*D)   (V = vocab_size; one-time, only when --resume_from is set.
-    # The optimizer state is just as big as the model itself: SparseAdam's momentum buffers are full
-    # dense (V, K*D) tensors -- sparsity only governs which rows get UPDATED per step, not how much
-    # memory the buffers occupy.)
+    # Time: O(V*K*D), Space: O(V*K*D)   (V = vocab_size; one-time, only when --resume_from is set)
     def _load_checkpoint(self) -> int:
         resume_dir = Path(self.config.resume_from)
 
@@ -180,10 +171,8 @@ class GmmTrainer:
 
 
     """ Runs every batch in the dataloader once, accumulating and logging epoch-level metrics."""
-    # Time: O(N*W*K^2*D) per epoch, Space: O(P*K^2*D) per batch   (N = corpus tokens, W = 2*window_size,
-    # P = batch_size*W; batch_size cancels out of the per-epoch total since (N/batch_size) batches each
-    # cost O(batch_size*W*K^2*D) -- see _run_batch. Bigger batches don't reduce total FLOPs, only how
-    # many times per-batch fixed overhead (kernel launches, the one sync at the end of _run_batch) is paid.)
+    # Time: O(N*W*K^2*D) per epoch   (N = corpus tokens, W = 2*window_size; total work per epoch
+    # doesn't depend on batch size, only how many times per-batch overhead gets paid)
     def _run_epoch(self, epoch: int, metrics: metrics_logger.MetricsLogger):
         epoch_start_time = time.perf_counter()
         # Weight each batch's stats by its pair count so the epoch average is exact
@@ -236,17 +225,15 @@ class GmmTrainer:
 
     """ Method that runs the forward/backward/step for one batch of (target, context, negative) ids and
         returns the numbers _run_epoch needs for logging."""
-    # Time: O(P*K^2*D), Space: O(P*K^2*D)   (P = target_ids.shape[0] = batch_size*2*window_size; dominated
-    # by the two forward() calls -- see log_overlap in gmm_word_embedding.py. The touched_ids/project_
-    # parameters_/optimizer.step() pieces are only O(T*K*D), T = touched rows, so they don't change this.)
+    # Time: O(P*K^2*D), Space: O(P*K^2*D)   (P = number of word pairs in the batch)
     def _run_batch(self, target_ids: torch.Tensor, ctx_ids: torch.Tensor, negative_samples: torch.Tensor) -> BatchStats:
         # Get positive and negative energies for this batch
         e_pos = self.model.forward(target_ids, ctx_ids)
         e_neg = self.model.forward(target_ids, negative_samples)
 
         # Get the means, variances, and mixture weights for the target words in this batch.
-        # Kept as GPU tensors (no .item() yet) so they can be synced to the CPU together,
-        # below, instead of one at a time -- see the comment there for why that matters.
+        # Left as GPU tensors for now so they can all be read off the GPU together, below,
+        # instead of one value at a time.
         with (torch.no_grad()):
             mu, var, mix_weights = self.model.get_word_params(target_ids)
             var_min = var.min()
@@ -257,16 +244,16 @@ class GmmTrainer:
         # Compute the max-margin ranking loss
         loss, active_fraction = self.model.max_margin_ranking(e_pos, e_neg, self.config.margin)
         loss.backward()
-        grad_norm = self._sparse_grad_norm()  # For logging only; see its docstring for why this isn't clip_grad_norm_
+        grad_norm = self._sparse_grad_norm()  # Logging only -- see its docstring
         self.optimizer.step()
-        # Only the rows this batch's embeddings looked up could have just moved (SparseAdam leaves every
-        # other row untouched), so only those need to be pulled back inside bounds.
+        # Only the words used in this batch could have just moved, so only those need re-checking.
         touched_ids = torch.unique(torch.cat([target_ids, ctx_ids, negative_samples]))
         self.model.project_parameters_(touched_ids)
         self.scheduler.step()
         self.optimizer.zero_grad()
 
-        # Gather all of our necessary attributes into one .tolist() call instead of 9 .item() calls
+        # Reading values off the GPU one at a time is slow; gathering them into one tensor first
+        # and converting them all at once is much faster.
         scalars = torch.stack([
             loss, active_fraction, e_pos.mean(), e_neg.mean(), grad_norm,
             mix_weight_spread, var_min, var_max, var_mean,
@@ -285,18 +272,15 @@ class GmmTrainer:
     """ Method to create the optimizer based on the configuration. Supports 'adam' and 'adagrad'. """
     def make_optimizer(self, parameters):
         if self.config.optimizer == "adam":
-            # SparseAdam, not plain Adam: the model's embeddings are sparse=True (see
-            # GMMWordEmbedding.__init__), and plain Adam can't consume sparse gradients at all.
-            # torch.optim.Adagrad below needs no equivalent swap -- it already handles sparse
-            # gradients natively.
+            # SparseAdam, not plain Adam: plain Adam can't handle the sparse gradients produced
+            # by this model's embeddings. Adagrad below needs no such swap; it supports both.
             return torch.optim.SparseAdam(parameters, lr=self.config.lr)
         if self.config.optimizer == "adagrad":
             return torch.optim.Adagrad(parameters, lr=self.config.lr)
         raise ValueError(f"Unknown optimizer '{self.config.optimizer}'. Use 'adagrad' or 'adam'.")
 
-    """ clip_grad_norm_ doesn't support sparse gradients -- this is the same global L2 norm it would
-        have computed, read directly from each sparse gradient's own nonzero values (the zero entries
-        wouldn't have contributed to the norm either way). Used for logging only, never for clipping. """
+    """ The usual gradient-norm helper (clip_grad_norm_) doesn't support sparse gradients, so this
+        computes the same value by hand, from each gradient's nonzero entries. Logging only. """
     # Time: O(T*K*D), Space: O(1)   (T = touched rows across all 3 embedding tables this step)
     def _sparse_grad_norm(self) -> torch.Tensor:
         squared_sums = [
@@ -315,9 +299,8 @@ class GmmTrainer:
                      model so a later run can continue the same optimizer/scheduler trajectory instead
                      of just warm-starting from these weights.
     """
-    # Time: O(V*K*D), Space: O(V*K*D)   (V = vocab_size; exports the whole vocab regardless of how
-    # sparse training was -- unavoidable, since the saved model has to cover every word, and dwarfed
-    # by the O(N*W*K^2*D) per-epoch training cost anyway, so --checkpoint_every 1 isn't a throughput concern)
+    # Time: O(V*K*D), Space: O(V*K*D)   (V = vocab_size; has to export every word, so this is
+    # unavoidable, but it's small next to a full epoch of training)
     def save_model(self, subdir: str = None, next_epoch: int = None):
         output_dir = Path(self.config.output_path)
         if subdir is not None:

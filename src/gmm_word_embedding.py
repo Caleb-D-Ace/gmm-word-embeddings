@@ -33,11 +33,9 @@ class GMMWordEmbedding(nn.Module):
         self.raw_var_lower = self.inverse_var_transform(var_lower)
         self.raw_var_upper = self.inverse_var_transform(var_upper)
 
-        # sparse=True: each batch only touches a few thousand of (potentially) millions of rows,
-        # but a dense Embedding still runs backward/optimizer.step() over the WHOLE table every
-        # batch regardless -- the cost scales with vocab_size, not batch_size. Sparse gradients
-        # (paired with SparseAdam in make_optimizer, and row-scoped project_parameters_ below)
-        # make the cost scale with how many distinct words actually appear in the batch instead.
+        # sparse=True: only updates the rows a batch actually uses, instead of the whole table
+        # every step. Matters once the vocabulary is much bigger than a single batch. Paired
+        # with SparseAdam (see make_optimizer) and project_parameters_ below.
         self.mu_embeddings = nn.Embedding(vocab_size, K * self.D, sparse=True)
         self.var_embeddings = nn.Embedding(vocab_size, K * self.D, sparse=True)
         self.mix_logits = nn.Embedding(vocab_size, K, sparse=True)
@@ -83,22 +81,14 @@ class GMMWordEmbedding(nn.Module):
         """
         return math.log(math.expm1(var - cls.VAR_FLOOR))
 
-    # Time: O(T*K*D), Space: O(T*K*D)   (T = len(word_ids), the batch's touched rows -- not V, thanks to
-    # sparse embeddings + SparseAdam; see __init__ and make_optimizer)
+    # Time: O(T*K*D), Space: O(T*K*D)   (T = number of word ids passed in, not the full vocabulary)
     @torch.no_grad()
     def project_parameters_(self, word_ids: torch.Tensor):
         """
-        Pulls the given words' variances and means back inside their bounds. Call this right after
-        optimizer.step(), passing the (deduplicated) word ids involved in this batch's forward pass --
-        under SparseAdam, a row is only ever touched by a step if it appeared in that step's gradient,
-        so these are the only rows that could have just drifted out of bounds. (With dense Adam, every
-        row's momentum could carry it out of bounds even on a batch that didn't touch it, which is why
-        this used to project the whole table; that's no longer true now that the embeddings and the
-        optimizer are both sparse-gradient-aware -- see their setup in __init__/make_optimizer.)
-
-        @torch.no_grad() turns off autograd for the whole method. These edits are corrections to the weights, not
-        part of the computation being differentiated, and autograd refuses in-place edits to a leaf tensor that
-        requires grad anyway.
+        Pulls the given words' variances and means back inside their allowed bounds. Call this
+        right after an optimizer step, passing only the word ids used in that batch -- with
+        sparse gradients, only those rows could have moved. no_grad() is used because these are
+        direct weight corrections, not part of the computation being trained.
         """
         # Variances: softplus is monotonic, so clamping the raw weight to [raw_lower, raw_upper] is the same as
         # clamping the variance to [var_lower, var_upper]. Advanced indexing (weight[word_ids]) returns a copy,
@@ -115,8 +105,8 @@ class GMMWordEmbedding(nn.Module):
         scale = (self.max_mean_norm / norms).clamp(max=1.0)
         self.mu_embeddings.weight[word_ids] = (mu_rows * scale).view(-1, self.K * self.D)
 
-    # Time: O(n*K^2*D), Space: O(n*K^2*D)   (n = mu1.shape[0] = P; the K*K broadcast below is the single
-    # largest compute block per batch -- everything else in the model is O(n*K*D) or smaller)
+    # Time: O(n*K^2*D), Space: O(n*K^2*D)   (n = batch size; comparing every pair of components
+    # is the costliest step in the model)
     @staticmethod
     def log_overlap(mu1, mu2, var1, var2):
         """
@@ -164,8 +154,7 @@ class GMMWordEmbedding(nn.Module):
 
         return -0.5 * dimensional_sum - (0.5 * D * log_constant)
 
-    # Time: O(n*K^2), Space: O(n*K^2)   (n = log_overlap_matrix.shape[0] = P; no D factor here -- log_overlap
-    # already reduced that axis)
+    # Time: O(n*K^2), Space: O(n*K^2)   (n = batch size; combines the overlaps above with mixture weights)
     @staticmethod
     def gmm_energy(log_overlap_matrix, p1, p2):
         """
@@ -190,24 +179,18 @@ class GMMWordEmbedding(nn.Module):
         return torch.logsumexp(log_mix_weights + log_overlap_matrix, dim=(-2, -1))  # Shape: (batch_size,)
 
 
-    # Time: O(P*K^2*D), Space: O(P*K^2*D)   (P = target_ids.shape[0] = batch_size*2*window_size;
-    # dominated by log_overlap -- see its comment)
+    # Time: O(P*K^2*D), Space: O(P*K^2*D)   (P = number of word pairs in the batch)
     def forward(self, target_ids: torch.Tensor, ctx_ids: torch.Tensor):
         """
         Forward pass execution method for PyTorch.
         Takes a batch of target and context word ids and returns the energy score for the whole batch.
         """
-        # Get target word parameters. These will be compiled for log_overlap and gmm_energy.
-        # torch.compile doesn't work for sparse gradient tensors, so we can't use this for the backward-pass optimizer.
-        # However, mu/var/mix_weights are plain dense tensors, so they compile fine.
+        # The embedding lookup itself stays uncompiled (it produces a sparse gradient, which the
+        # compiler can't handle), but its output is a normal dense tensor, so everything after
+        # this point can safely use the compiled, faster versions below.
         mu1, var1, p1 = self.get_word_params(target_ids)
         mu2, var2, p2 = self.get_word_params(ctx_ids)
 
-        # Compiled versions of log_overlap/gmm_energy (defined at module scope below the class),
-        # not the plain staticmethods -- those stay uncompiled so tests can call them directly as
-        # a readable reference implementation. Verified numerically identical to eager; measured
-        # ~1.33x faster at batch_size=2560 by fusing this sequential chain of small elementwise
-        # ops into fewer kernel launches.
         overlap = _compiled_log_overlap(mu1, mu2, var1, var2)
 
         # Calculate total GMM energy based on the overlaps and the probability weights
@@ -238,33 +221,20 @@ class GMMWordEmbedding(nn.Module):
         return (torch.mean(hinge_loss), active_pairs)
 
 
-# Separate from the class body, not decorated onto the staticmethods directly, so
-# GMMWordEmbedding.log_overlap/gmm_energy stay plain and directly callable for tests/reference use.
-# Default to uncompiled here; enable_torch_compile() (below) opts in. forward() looks these names
-# up fresh from this module's globals on every call (ordinary Python name resolution, not a value
-# captured once at import time), so reassigning them later still takes effect for every call after.
+# Defaults to the plain, uncompiled functions. enable_torch_compile() below can switch these to
+# compiled versions; forward() always reads the current value, so switching later still works.
 _compiled_log_overlap = GMMWordEmbedding.log_overlap
 _compiled_gmm_energy = GMMWordEmbedding.gmm_energy
 
 
 def enable_torch_compile():
     """
-    Opts forward() into torch.compile for log_overlap/gmm_energy. Call this only from the main
-    process (GmmTrainer._setup() does, exactly once) -- never from a DataLoader worker.
-
-    Not done unconditionally at module import: workers under multiprocessing_context="spawn"
-    each re-import this whole module from scratch (spawn re-executes the main script's module
-    tree in every child process), and creating a torch.compile() wrapper -- even one that's never
-    called -- pulls in Dynamo/Inductor and costs real memory (confirmed empirically: ~200MB per
-    process) for machinery a worker never uses, since workers only ever call
-    SkipGramDataset.__getitem__, never forward(). Checking "am I a worker" at module-import time
-    doesn't work either (confirmed empirically): multiprocessing.parent_process() still reports
-    None even inside a spawned worker at that point -- that context isn't established until
-    PyTorch's own worker loop starts running, which happens after module imports finish. So
-    instead of detecting it, this makes enabling compilation an explicit action taken only from
-    a place workers never execute (GmmTrainer._setup()), rather than something every process
-    does by default.
+    Turns on torch.compile for the parts of the model that support it. Call this only from the
+    main training process, not from a data-loading worker -- compiling has a real setup cost
+    that workers don't need to pay. Falls back to normal execution automatically if the GPU or
+    software doesn't support compiling, so it's always safe to call.
     """
     global _compiled_log_overlap, _compiled_gmm_energy
+    torch._dynamo.config.suppress_errors = True
     _compiled_log_overlap = torch.compile(GMMWordEmbedding.log_overlap)
     _compiled_gmm_energy = torch.compile(GMMWordEmbedding.gmm_energy)

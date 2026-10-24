@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from dataset import SkipGramDataset
-from gmm_word_embedding import GMMWordEmbedding
+from gmm_word_embedding import GMMWordEmbedding, enable_torch_compile
 import metrics_logger
 from preprocess import id_dtype
 from sampler import NegativeSampler, ShuffleBufferSampler
@@ -113,6 +113,10 @@ class GmmTrainer:
             self.vocab_size, self.config.embedding_dim, self.config.K,
             var_lower=self.config.var_lower, var_upper=self.config.var_upper, max_mean_norm=self.config.max_mean_norm,
         ).to(self.device)
+        # Only ever called here, in the main process -- never by a DataLoader worker (workers
+        # only call SkipGramDataset.__getitem__, never _setup()). See enable_torch_compile's
+        # docstring for why that distinction has to be made this way instead of autodetected.
+        enable_torch_compile()
         self.dataset = SkipGramDataset(
             bin_file=Path(self.config.processed_dir) / "corpus_index.bin",
             window_size=self.config.window_size, dtype=id_dtype(self.vocab_size),

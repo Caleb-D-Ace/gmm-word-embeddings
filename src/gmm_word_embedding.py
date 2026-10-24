@@ -1,4 +1,5 @@
 import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -237,10 +238,33 @@ class GMMWordEmbedding(nn.Module):
         return (torch.mean(hinge_loss), active_pairs)
 
 
-# Compiled separately from the class body, not decorated onto the staticmethods directly, so
+# Separate from the class body, not decorated onto the staticmethods directly, so
 # GMMWordEmbedding.log_overlap/gmm_energy stay plain and directly callable for tests/reference use.
-# torch.compile here is lazy -- defining these doesn't trigger compilation, only the first
-# real call with concrete shapes does (and triggers again if a new shape shows up, e.g. a
-# shorter final batch at the end of an epoch).
-_compiled_log_overlap = torch.compile(GMMWordEmbedding.log_overlap)
-_compiled_gmm_energy = torch.compile(GMMWordEmbedding.gmm_energy)
+# Default to uncompiled here; enable_torch_compile() (below) opts in. forward() looks these names
+# up fresh from this module's globals on every call (ordinary Python name resolution, not a value
+# captured once at import time), so reassigning them later still takes effect for every call after.
+_compiled_log_overlap = GMMWordEmbedding.log_overlap
+_compiled_gmm_energy = GMMWordEmbedding.gmm_energy
+
+
+def enable_torch_compile():
+    """
+    Opts forward() into torch.compile for log_overlap/gmm_energy. Call this only from the main
+    process (GmmTrainer._setup() does, exactly once) -- never from a DataLoader worker.
+
+    Not done unconditionally at module import: workers under multiprocessing_context="spawn"
+    each re-import this whole module from scratch (spawn re-executes the main script's module
+    tree in every child process), and creating a torch.compile() wrapper -- even one that's never
+    called -- pulls in Dynamo/Inductor and costs real memory (confirmed empirically: ~200MB per
+    process) for machinery a worker never uses, since workers only ever call
+    SkipGramDataset.__getitem__, never forward(). Checking "am I a worker" at module-import time
+    doesn't work either (confirmed empirically): multiprocessing.parent_process() still reports
+    None even inside a spawned worker at that point -- that context isn't established until
+    PyTorch's own worker loop starts running, which happens after module imports finish. So
+    instead of detecting it, this makes enabling compilation an explicit action taken only from
+    a place workers never execute (GmmTrainer._setup()), rather than something every process
+    does by default.
+    """
+    global _compiled_log_overlap, _compiled_gmm_energy
+    _compiled_log_overlap = torch.compile(GMMWordEmbedding.log_overlap)
+    _compiled_gmm_energy = torch.compile(GMMWordEmbedding.gmm_energy)

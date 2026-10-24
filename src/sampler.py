@@ -29,7 +29,7 @@ class ShuffleBufferSampler(Sampler[int]):
     def __len__(self):
         return len(self.data_source)
 
-    # Time: O(n), Space: O(buffer_size)   (n = len(data_source); space independent of n -- that's the point)
+    # Time: O(n), Space: O(buffer_size)   (n = len(data_source); space independent of n)
     def __iter__(self):
         n = len(self.data_source)
         rng = np.random.default_rng(self.seed)
